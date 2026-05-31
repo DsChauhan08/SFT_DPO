@@ -205,5 +205,6 @@ def _mp_fn(index):
 # 5. IGNITION 
 # ==============================================================================
 if __name__ == "__main__":
-    # This fires up all 8 TPU cores and runs the _mp_fn function on each of them!
-    xmp.spawn(_mp_fn, args=(), nprocs=8, start_method='fork')
+    # This fires up all TPU cores and runs the _mp_fn function on each of them!
+    # CRITICAL FIX: PJRT requires nprocs=None to auto-detect all 8 cores.
+    xmp.spawn(_mp_fn, args=(), nprocs=None, start_method='fork')
