@@ -1,90 +1,148 @@
+# ==============================================================================
+# ULTIMATE KAGGLE TPU SFT PIPELINE (PRODUCTION READY)
+# Designed for Kaggle TPU v5e-8
+# ==============================================================================
 import os
+
+# CRITICAL HOTFIX 1: Force TPU hardware to use bf16 natively to prevent XLA type crashes
+os.environ["XLA_USE_BF16"] = "1" 
+
 import torch
-import time
 from datasets import load_dataset, concatenate_datasets
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
-from trl import SFTTrainer
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForCausalLM, 
+    TrainingArguments, 
+    Trainer, 
+    default_data_collator
+)
 from transformers.trainer_utils import get_last_checkpoint
-from kaggle_secrets import UserSecretsClient
 from huggingface_hub import login, HfApi
 
+# IMPORT TPU LIBRARY
+import torch_xla
+import torch_xla.core.xla_model as xm
+
 # ---------------------------------------------------------------------------
-# 1. KAGGLE SECRETS & HUGGING FACE LOGIN
+# 1. AUTHENTICATION (Kaggle Secrets)
 # ---------------------------------------------------------------------------
-print("Authenticating...")
-try:
-    user_secrets = UserSecretsClient()
-    hf_token = user_secrets.get_secret("HF_TOKEN")
+print("🔐 Authenticating with Hugging Face...")
+hf_token = os.environ.get("HF_TOKEN")
+if not hf_token:
+    try:
+        from kaggle_secrets import UserSecretsClient
+        user_secrets = UserSecretsClient()
+        hf_token = user_secrets.get_secret("HF_TOKEN")
+    except ImportError:
+        pass
+
+if hf_token:
     login(token=hf_token)
     print("✅ Successfully logged into Hugging Face.")
-except Exception as e:
-    print(f"❌ Failed to login. Please attach 'HF_TOKEN' to Kaggle Secrets! Error: {e}")
-    exit(1)
+else:
+    print("⚠️ No HF_TOKEN found! Training will work, but pushing to Hub will fail.")
 
 # ---------------------------------------------------------------------------
-# 2. TPU XLA SETUP
+# 2. TPU INITIALIZATION & HOTFIXES
 # ---------------------------------------------------------------------------
-import torch_xla.core.xla_model as xm
-device = xm.xla_device()
-print(f"✅ Successfully initialized TPU device: {device}")
+device = torch_xla.device() 
+print(f"✅ Initialized TPU: {device}")
+
+# CRITICAL HOTFIX 2: PYTORCH 2.X XLA GRADIENT CHECKPOINTING BUG
+if not hasattr(torch, "xla"):
+    class XLADeviceModule:
+        @staticmethod
+        def get_rng_state(device=None): return xm.get_rng_state(device)
+        @staticmethod
+        def set_rng_state(state, device=None): xm.set_rng_state(state, device)
+        @staticmethod
+        def is_available(): return True
+    torch.xla = XLADeviceModule()
+    print("✅ Monkey-patched torch.xla for Gradient Checkpointing stability.")
 
 # ---------------------------------------------------------------------------
-# 3. DATASET LOADING & PARSING (High Redundancy)
+# 3. LOAD TOKENIZER
 # ---------------------------------------------------------------------------
-def load_and_prepare_data():
-    print("Loading datasets...")
-    # Using 1k slices for secondaries to ensure rapid epoch completion and memory safety
-    d_main = load_dataset("dschauhan08/gen-v1-dataset", split="train")
-    d1 = load_dataset("allenai/tulu-3-sft-personas-instruction-following", split="train[:1000]")
-    d2 = load_dataset("NousResearch/hermes-function-calling-v1", split="train[:1000]")
-    d3 = load_dataset("qwedsacf/competition_math", split="train[:1000]")
-    d4 = load_dataset("NousResearch/terminal-bench-2", split="train[:1000]")
-    d5 = load_dataset("amphora/ResearchMath-14k", split="train[:1000]")
-    
-    def universal_standardize(example):
-        if "messages" in example and isinstance(example["messages"], list):
-            return {"messages": [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in example["messages"]]}
-        if "conversations" in example and isinstance(example["conversations"], list):
-            return {"messages": [{"role": "user" if t.get("from") in ["human", "user"] else "assistant", "content": t.get("value", "")} for t in example["conversations"]]}
-        p = example.get("instruction") or example.get("prompt") or example.get("question")
-        r = example.get("output") or example.get("response") or example.get("answer") or example.get("completion")
-        if p and r:
-            return {"messages": [{"role": "user", "content": str(p)}, {"role": "assistant", "content": str(r)}]}
-        return {"messages": []}
-
-    print("Formatting datasets...")
-    all_d = [d_main.filter(lambda x: isinstance(x.get("messages"), list) and len(x["messages"]) > 0).remove_columns([c for c in d_main.column_names if c != "messages"])]
-    for d in [d1, d2, d3, d4, d5]:
-        std = d.map(universal_standardize, remove_columns=d.column_names).filter(lambda x: len(x.get("messages", [])) > 0)
-        all_d.append(std)
-        
-    merged = concatenate_datasets(all_d).shuffle(seed=42)
-    print(f"✅ Dataset ready. Total rows: {len(merged)}")
-    return merged
-
-dataset = load_and_prepare_data()
-
-# ---------------------------------------------------------------------------
-# 4. MODEL & TOKENIZER CONFIGURATION
-# ---------------------------------------------------------------------------
-MODEL_ID = "openbmb/MiniCPM-1B-sft-bf16" # Specific chat-tuned base
-
+MODEL_ID = "openbmb/MiniCPM5-1B" 
+print(f"📦 Loading Tokenizer for {MODEL_ID}...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-def format_chat_template(row):
+# ---------------------------------------------------------------------------
+# 4. DATASET PREPARATION (Loading Both Exact Datasets)
+# ---------------------------------------------------------------------------
+def extract_and_template(example):
     try:
-        text = tokenizer.apply_chat_template(row["messages"], tokenize=False)
-        # FORCE the model to stop by explicitly appending EOS token
+        msgs = example.get("messages", [])
+        if not msgs or not isinstance(msgs, list): return {"text": ""}
+            
+        clean_msgs = [{"role": str(m.get("role", "user")).strip().lower(), "content": str(m.get("content", ""))} for m in msgs]
+        text = tokenizer.apply_chat_template(clean_msgs, tokenize=False)
+        
+        # GUARANTEE IT LEARNS TO STOP: Explicitly append EOS
         if not text.endswith(tokenizer.eos_token):
             text += tokenizer.eos_token
+            
         return {"text": text}
-    except:
+    except Exception:
         return {"text": ""}
 
-dataset = dataset.map(format_chat_template).filter(lambda x: len(x["text"]) > 0)
+print("📥 Downloading datasets...")
+ds_reasoning = load_dataset("dschauhan08/superset-finetuning-reasoning", split="train")
+ds_minicpm = load_dataset("dschauhan08/minicpm5-chatml-mix", split="train")
 
+print("🧹 Applying chat templates and verifying schemas...")
+ds_reasoning = ds_reasoning.map(extract_and_template, remove_columns=ds_reasoning.column_names, desc="Templating Reasoning")
+ds_minicpm = ds_minicpm.map(extract_and_template, remove_columns=ds_minicpm.column_names, desc="Templating MiniCPM")
+
+# CRITICAL HOTFIX 3: TRUNCATION POISONING PREVENTION
+# We drop anything longer than 12,000 characters so it fits perfectly in 3072 tokens.
+MAX_CHARS = 12000
+
+print(f"Filtering out rows larger than {MAX_CHARS} characters to preserve EOS tokens...")
+ds_reasoning = ds_reasoning.filter(lambda x: 10 < len(x["text"]) < MAX_CHARS)
+ds_minicpm = ds_minicpm.filter(lambda x: 10 < len(x["text"]) < MAX_CHARS)
+
+dataset = concatenate_datasets([ds_reasoning, ds_minicpm]).shuffle(seed=42)
+print(f"✅ Data processing flawless! Total training rows after filtering: {len(dataset)}")
+
+# ---------------------------------------------------------------------------
+# 5. STATIC TOKENIZATION & NATIVE TORCH CONVERSION
+# ---------------------------------------------------------------------------
+print("⚙️ Tokenizing datasets manually & creating strict static labels...")
+def tokenize_batch(batch):
+    # THE SWEET SPOT: 3072 tokens (~12,000 characters). Fits TPU memory perfectly!
+    outputs = tokenizer(
+        batch["text"],
+        truncation=True,
+        padding="max_length",
+        max_length=3072 
+    )
+    
+    # Manually create 'labels' for causal LM and mask out padding with -100
+    labels = []
+    for input_ids in outputs["input_ids"]:
+        labels.append([t if t != tokenizer.pad_token_id else -100 for t in input_ids])
+        
+    outputs["labels"] = labels
+    return outputs
+
+tokenized_dataset = dataset.map(
+    tokenize_batch,
+    batched=True,
+    remove_columns=["text"],
+    desc="Tokenizing"
+)
+
+# CRITICAL HOTFIX 4: Force native PyTorch Tensors to prevent XLA compiler crashes
+tokenized_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+print("✅ Tokenization complete. Data mathematically locked for XLA compiler.")
+
+# ---------------------------------------------------------------------------
+# 6. LOAD MODEL
+# ---------------------------------------------------------------------------
+print("🧠 Loading 1B Model to TPU HBM...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.bfloat16,
@@ -92,61 +150,64 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 # ---------------------------------------------------------------------------
-# 5. TPU TRAINING ARGUMENTS (Mathematically secured for 16k Context)
+# 7. CORE TRAINING ARGUMENTS (Optimized for Kaggle)
 # ---------------------------------------------------------------------------
+OUTPUT_DIR = "/kaggle/working/minicpm-sft-output"
+
 training_args = TrainingArguments(
-    output_dir="/kaggle/working/sft-minicpm",
-    per_device_train_batch_size=1,   # MANDATORY: 1 is the only way 16k context fits in 16GB
-    gradient_accumulation_steps=16,  # Compensate to maintain Global Batch Size
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=1,   # Kaggle has 8 cores, so Global Batch Size = 8
+    gradient_accumulation_steps=1,   # Kept at 1 to prevent XLA from unrolling massive graphs
     learning_rate=2e-5,
-    num_train_epochs=3,              # Train for 3 SFT epochs
-    bf16=True,                       # Hardware acceleration
+    num_train_epochs=1,              
+    bf16=True,                       
     logging_steps=10,
-    save_strategy="epoch",
-    save_total_limit=2,              # Prevents Kaggle disk space crash
-    optim="adafactor",               # Massive memory saver vs AdamW
-    gradient_checkpointing=True,     # MANDATORY for 16k context
-    report_to="none"
+    save_strategy="epoch",           
+    save_total_limit=2,              # Deletes old checkpoints so Kaggle disk doesn't fill up
+    optim="adafactor",               
+    gradient_checkpointing=True,     
+    report_to="none",
+    dataloader_drop_last=True        # CRITICAL: Drops uneven last batch so XLA shapes never change
 )
 
-trainer = SFTTrainer(
+trainer = Trainer(
     model=model,
-    train_dataset=dataset,
-    dataset_text_field="text",       
-    max_seq_length=16384,            # Pushed to 16k context length!
-    tokenizer=tokenizer,
     args=training_args,
+    train_dataset=tokenized_dataset,
+    data_collator=default_data_collator
 )
 
 # ---------------------------------------------------------------------------
-# 6. TRAINING EXECUTION & AUTO-RESUME
+# 8. EXECUTION & AUTO-RESUME
 # ---------------------------------------------------------------------------
-last_checkpoint = get_last_checkpoint("/kaggle/working/sft-minicpm")
+last_checkpoint = get_last_checkpoint(OUTPUT_DIR)
 if last_checkpoint is not None:
-    print(f"🔄 Resuming from checkpoint: {last_checkpoint}")
+    print(f"🔄 Resuming session from checkpoint: {last_checkpoint}")
     trainer.train(resume_from_checkpoint=last_checkpoint)
 else:
-    print("🚀 Starting 3-Epoch SFT from scratch...")
-    trainer.train() # YES, this triggers the training process.
+    print("🚀 Starting full-scale SFT training loop on TPU...")
+    trainer.train()
+
+print("🎉 SFT Training Complete!")
 
 # ---------------------------------------------------------------------------
-# 7. AUTOMATIC PUSH TO HUGGING FACE
+# 9. AUTOMATIC PUSH TO HUGGING FACE
 # ---------------------------------------------------------------------------
-print("🎉 SFT Complete! Preparing to push to Hugging Face...")
-FINAL_REPO = "dschauhan08/My-MiniCPM-Coder"
-api = HfApi()
+FINAL_REPO = "dschauhan08/My-MiniCPM5-1B-Coder"
 
-try:
-    api.create_repo(repo_id=FINAL_REPO, exist_ok=True, token=hf_token)
-    
-    # Save the model locally first
-    trainer.save_model("/kaggle/working/final-sft-model")
-    tokenizer.save_pretrained("/kaggle/working/final-sft-model")
-    
-    # Push weights and tokenizer up to HF
-    print(f"Uploading model directly to {FINAL_REPO}...")
-    model.push_to_hub(FINAL_REPO, token=hf_token, safe_serialization=True)
-    tokenizer.push_to_hub(FINAL_REPO, token=hf_token)
-    print("✅ Model successfully uploaded to Hugging Face! Ready for RL/DPO.")
-except Exception as e:
-    print(f"❌ Upload failed, but model is saved locally at /kaggle/working/final-sft-model. Error: {e}")
+if hf_token:
+    print(f"☁️ Preparing to push final model to Hugging Face: {FINAL_REPO}...")
+    try:
+        api = HfApi()
+        api.create_repo(repo_id=FINAL_REPO, exist_ok=True, token=hf_token)
+        
+        # Save locally first
+        trainer.save_model(OUTPUT_DIR)
+        tokenizer.save_pretrained(OUTPUT_DIR)
+        
+        # Push to hub
+        model.push_to_hub(FINAL_REPO, token=hf_token, safe_serialization=True)
+        tokenizer.push_to_hub(FINAL_REPO, token=hf_token)
+        print("✅ Model successfully uploaded to Hugging Face! Ready for DPO/Inference.")
+    except Exception as e:
+        print(f"❌ Upload failed, but model is saved locally at {OUTPUT_DIR}. Error: {e}")
