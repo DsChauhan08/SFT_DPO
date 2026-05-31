@@ -87,8 +87,11 @@ ds_reasoning = load_dataset("dschauhan08/superset-finetuning-reasoning", split="
 ds_minicpm = load_dataset("dschauhan08/minicpm5-chatml-mix", split="train")
 
 print("🧹 Applying chat templates and verifying schemas...")
-ds_reasoning = ds_reasoning.map(extract_and_template, remove_columns=ds_reasoning.column_names, desc="Templating Reasoning")
-ds_minicpm = ds_minicpm.map(extract_and_template, remove_columns=ds_minicpm.column_names, desc="Templating MiniCPM")
+# Get the number of CPU cores to massively parallelize data processing
+NUM_CPUS = os.cpu_count() or 4
+
+ds_reasoning = ds_reasoning.map(extract_and_template, remove_columns=ds_reasoning.column_names, desc="Templating Reasoning", num_proc=NUM_CPUS)
+ds_minicpm = ds_minicpm.map(extract_and_template, remove_columns=ds_minicpm.column_names, desc="Templating MiniCPM", num_proc=NUM_CPUS)
 
 MAX_CHARS = 12000
 print(f"Filtering out rows larger than {MAX_CHARS} characters to preserve EOS tokens...")
@@ -118,7 +121,8 @@ tokenized_dataset = dataset.map(
     tokenize_batch,
     batched=True,
     remove_columns=["text"],
-    desc="Tokenizing"
+    desc="Tokenizing",
+    num_proc=NUM_CPUS  # Apply multiprocessing to Tokenization as well!
 )
 
 # Force native PyTorch Tensors
